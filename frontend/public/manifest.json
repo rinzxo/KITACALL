@@ -1,0 +1,26 @@
+{
+  "name": "KitaCall — Tactical Walkie-Talkie Transceiver",
+  "short_name": "KitaCall HT",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0F172A",
+  "theme_color": "#0F172A",
+  "description": "Sistem Komunikasi Taktis Push-to-Talk (HT) & Mesin Auto-Answer Tembus Mode Silent pada Ekosistem KitaCall",
+  "icons": [
+    {
+      "src": "/KitaCall%20Emblem.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/KitaCall%20Emblem.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "permissions": ["microphone", "notifications", "wake-lock"]
+}

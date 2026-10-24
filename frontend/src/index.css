@@ -1,0 +1,142 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 40% 98%; /* slate-50 */
+    --foreground: 222.2 84% 4.9%; /* zinc-950 */
+
+    --card: 0 0% 100%; /* white */
+    --card-foreground: 222.2 84% 4.9%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 84% 4.9%;
+
+    --primary: 208 100% 50%; /* #0087FF from KitaAtur logo */
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 195 95% 94%; /* #E0F4FE logo soft cyan */
+    --secondary-foreground: 208 100% 40%;
+
+    --muted: 214.3 31.8% 91.4%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+
+    --accent: 195 95% 94%;
+    --accent-foreground: 208 100% 40%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 208 100% 50%;
+
+    --radius: 1rem;
+  }
+}
+
+.bg-brand-gradient {
+  background: linear-gradient(135deg, #0087FF 0%, #01C4FB 100%);
+}
+
+.bg-brand-gradient-hover:hover {
+  background: linear-gradient(135deg, #0077E6 0%, #00B5EA 100%);
+}
+
+.text-brand-gradient {
+  background: linear-gradient(135deg, #0087FF 0%, #01C4FB 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.shadow-brand {
+  box-shadow: 0 10px 25px -5px rgba(0, 135, 255, 0.25), 0 8px 10px -6px rgba(1, 196, 251, 0.2);
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Tactical Audio Wave Animation */
+@keyframes audioWave {
+  0%, 100% { height: 6px; }
+  50% { height: 28px; }
+}
+
+.animate-audio-bar-1 { animation: audioWave 0.7s infinite ease-in-out; }
+.animate-audio-bar-2 { animation: audioWave 0.5s infinite ease-in-out 0.15s; }
+.animate-audio-bar-3 { animation: audioWave 0.8s infinite ease-in-out 0.3s; }
+.animate-audio-bar-4 { animation: audioWave 0.6s infinite ease-in-out 0.1s; }
+.animate-audio-bar-5 { animation: audioWave 0.75s infinite ease-in-out 0.25s; }
+
+/* Disable mobile bounce and pull-to-refresh on tactical PTT */
+html, body {
+  overscroll-behavior-y: contain;
+}
+
+/* Tactical Radio Typography */
+.font-mono-lcd {
+  font-family: 'Share Tech Mono', 'Courier New', monospace;
+  letter-spacing: 0.05em;
+}
+
+.font-tactical {
+  font-family: 'Orbitron', 'Inter', sans-serif;
+  letter-spacing: 0.08em;
+}
+
+/* Authentic HT Radio Bezel & Glass Screen */
+.radio-lcd-glass {
+  background: radial-gradient(circle at 50% 20%, rgba(255,255,255,0.06), transparent 70%), linear-gradient(180deg, #09131F 0%, #050B13 100%);
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.8), inset 0 -1px 2px rgba(255, 255, 255, 0.1), 0 4px 14px rgba(0, 0, 0, 0.25);
+  border: 1.5px solid rgba(255, 255, 255, 0.08);
+}
+
+/* Realistic PTT Rubber Grip Ribs */
+.ptt-rubber-ribs {
+  background-image: repeating-linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.12) 0px,
+    rgba(255, 255, 255, 0.12) 3px,
+    transparent 3px,
+    transparent 10px
+  );
+}
+
+/* Radio Speaker Acoustic Slits */
+.radio-speaker-slits {
+  background: repeating-linear-gradient(
+    180deg,
+    rgba(15, 23, 42, 0.9) 0px,
+    rgba(15, 23, 42, 0.9) 3px,
+    rgba(30, 41, 59, 0.5) 3px,
+    rgba(30, 41, 59, 0.5) 7px
+  );
+}
+
+/* Tactical Knurling for Dials and Knobs */
+.radio-knurl {
+  background: repeating-linear-gradient(
+    90deg,
+    #334155 0px,
+    #334155 2px,
+    #1e293b 2px,
+    #1e293b 4px
+  );
+}
+
+/* Heavy-duty Chassis Texture */
+.radio-chassis-shell {
+  background: linear-gradient(180deg, #F8FAFC 0%, #EDF2F7 100%);
+  box-shadow: 0 10px 40px -10px rgba(15, 23, 42, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
