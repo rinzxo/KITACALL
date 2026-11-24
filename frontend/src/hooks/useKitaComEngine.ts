@@ -220,7 +220,7 @@ export function useKitaComEngine({
       if (audioTrack) {
         peerConnectionsRef.current.forEach((pc) => {
           const senders = pc.getSenders();
-          const audioSender = senders.find(s => s.track?.kind === 'audio' || s.kind === 'audio' || !s.track);
+          const audioSender = senders.find(s => s.track?.kind === 'audio' || !s.track);
           if (audioSender) {
             audioSender.replaceTrack(audioTrack).catch(err => {
               console.warn('[KitaCom WebRTC] replaceTrack error:', err);
