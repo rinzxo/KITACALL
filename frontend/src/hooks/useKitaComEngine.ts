@@ -52,7 +52,8 @@ interface UseKitaComEngineProps {
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-    { urls: ['stun:stun2.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
+    { urls: ['stun:stun2.l.google.com:19302', 'stun:stun3.l.google.com:19302'] },
+    { urls: ['stun:stun4.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
     {
       urls: [
         'turn:openrelay.metered.ca:80',
@@ -131,6 +132,7 @@ export function useKitaComEngine({
   const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const makingOfferRef = useRef<Map<string, boolean>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
+  const silentStreamRef = useRef<MediaStream | null>(null);
 
   // Monitor Battery API
   useEffect(() => {
@@ -151,7 +153,6 @@ export function useKitaComEngine({
       const ctx = new AudioCtxClass();
       audioCtxRef.current = ctx;
 
-      // Master Radio Gain: Bila Siaga mati, suara radio 0.0 (hening total)
       const masterGain = ctx.createGain();
       masterGain.gain.setValueAtTime(isDutyActiveRef.current ? 1.0 : 0.0, ctx.currentTime);
       masterGain.connect(ctx.destination);
@@ -163,6 +164,33 @@ export function useKitaComEngine({
     }
 
     return audioCtxRef.current;
+  }, []);
+
+  // KUNCI EMAS 3+ PERANGKAT: Buat dummy silent track Web Audio murni.
+  // Menjamin SDP offer/answer antar peer SELALU berarah sendrecv (dua arah penuh),
+  // sehingga audio tidak pernah tertolak dengan status recvonly saat mic baru dibuka belakangan!
+  const getOrCreateSilentTrack = useCallback((): MediaStreamTrack | null => {
+    if (silentStreamRef.current && silentStreamRef.current.active && silentStreamRef.current.getAudioTracks()[0]) {
+      return silentStreamRef.current.getAudioTracks()[0];
+    }
+    try {
+      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = audioCtxRef.current || new AudioCtxClass();
+      if (!audioCtxRef.current) audioCtxRef.current = ctx;
+
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      gain.gain.value = 0.0; // Hening mutlak
+      osc.connect(gain);
+      const dst = ctx.createMediaStreamDestination();
+      gain.connect(dst);
+      osc.start();
+      silentStreamRef.current = dst.stream;
+      return dst.stream.getAudioTracks()[0];
+    } catch (e) {
+      console.warn('[KitaCom WebRTC] Silent track initialization notice:', e);
+      return null;
+    }
   }, []);
 
   // Ensure Local Microphone MediaStream (Acquires mic with hardware echo cancellation)
@@ -187,12 +215,12 @@ export function useKitaComEngine({
       });
       localStreamRef.current = stream;
 
-      // Pasang track ke semua RTCPeerConnection yang sudah ada via replaceTrack atau sender
+      // Pasang track mic sungguhan ke semua RTCPeerConnection yang sudah ada via replaceTrack
       const audioTrack = stream.getAudioTracks()[0];
       if (audioTrack) {
         peerConnectionsRef.current.forEach((pc) => {
           const senders = pc.getSenders();
-          const audioSender = senders.find(s => s.track?.kind === 'audio' || !s.track);
+          const audioSender = senders.find(s => s.track?.kind === 'audio' || s.kind === 'audio' || !s.track);
           if (audioSender) {
             audioSender.replaceTrack(audioTrack).catch(err => {
               console.warn('[KitaCom WebRTC] replaceTrack error:', err);
@@ -201,7 +229,7 @@ export function useKitaComEngine({
             try {
               pc.addTrack(audioTrack, stream);
             } catch (e) {
-              console.warn('[KitaCom WebRTC] addTrack fallback notice:', e);
+              console.warn('[KitaCom WebRTC] addTrack notice:', e);
             }
           }
         });
@@ -213,7 +241,7 @@ export function useKitaComEngine({
     }
   }, []);
 
-  // WebRTC Peer Connection Factory (Mesh P2P with Perfect Negotiation)
+  // WebRTC Peer Connection Factory (Mesh P2P with Robust Multi-Party Handshake)
   const createPeerConnection = useCallback((targetSocketId: string, isInitiator: boolean, socket: Socket): RTCPeerConnection => {
     const existing = peerConnectionsRef.current.get(targetSocketId);
     if (existing && existing.connectionState !== 'closed' && existing.connectionState !== 'failed') {
@@ -225,10 +253,17 @@ export function useKitaComEngine({
     peerConnectionsRef.current.set(targetSocketId, pc);
     makingOfferRef.current.set(targetSocketId, false);
 
-    // KUNCI EMAS WEBRTC BERGANTIAN: Selalu tambahkan transceiver audio sendrecv di awal!
-    // Ini memastikan jalur Opus dua arah terbentuk sempurna sebelum mic dipegang.
-    if (localStreamRef.current && localStreamRef.current.getAudioTracks()[0]) {
-      pc.addTrack(localStreamRef.current.getAudioTracks()[0], localStreamRef.current);
+    // KUNCI EMAS 3+ DEVICE: Selalu pasang track audio (nyata atau silent) di awal agar kedua arah aktif sendrecv
+    const activeTrack = (localStreamRef.current && localStreamRef.current.active && localStreamRef.current.getAudioTracks()[0])
+      ? localStreamRef.current.getAudioTracks()[0]
+      : getOrCreateSilentTrack();
+
+    if (activeTrack) {
+      try {
+        pc.addTrack(activeTrack, localStreamRef.current || silentStreamRef.current || new MediaStream([activeTrack]));
+      } catch (err) {
+        pc.addTransceiver('audio', { direction: 'sendrecv' });
+      }
     } else {
       pc.addTransceiver('audio', { direction: 'sendrecv' });
     }
@@ -263,18 +298,41 @@ export function useKitaComEngine({
       if (!shouldMute) {
         audioEl.play().catch(e => console.warn('[KitaCom WebRTC] audioEl play error:', e));
       }
+
+      // Deteksi ketika track remote di-unmute (teman sedang memencet PTT)
+      event.track.onunmute = () => {
+        console.log('[KitaCom WebRTC] Track unmuted from peer:', targetSocketId);
+        if (isDutyActiveRef.current && !isTransmittingRef.current && audioEl) {
+          audioEl.muted = false;
+          audioEl.volume = 1.0;
+          audioEl.play().catch(() => {});
+        }
+      };
     };
 
+    // Auto-reconnect jika salah satu peer connection gagal di jaringan mesh
     pc.onconnectionstatechange = () => {
       console.log(`[KitaCom WebRTC Peer ${targetSocketId}] State:`, pc.connectionState);
-      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        pc.close();
+      if (pc.connectionState === 'failed') {
+        console.warn(`[KitaCom WebRTC Peer ${targetSocketId}] Connection failed, auto-reconnecting...`);
+        try { pc.close(); } catch (e) {}
+        peerConnectionsRef.current.delete(targetSocketId);
+        makingOfferRef.current.delete(targetSocketId);
+        
+        // Coba hubungkan ulang jika peer masih tercatat di roster
+        if (socket.connected && rosterRef.current.some(m => m.socketId === targetSocketId)) {
+          setTimeout(() => {
+            const shouldInitiate = socket.id < targetSocketId;
+            createPeerConnection(targetSocketId, shouldInitiate, socket);
+          }, 1500);
+        }
+      } else if (pc.connectionState === 'closed') {
         peerConnectionsRef.current.delete(targetSocketId);
         makingOfferRef.current.delete(targetSocketId);
       }
     };
 
-    // Inisiasi offer jika ditugaskan sebagai initiator (misal socket.id lebih kecil)
+    // Inisiasi offer jika ditugaskan sebagai initiator
     if (isInitiator) {
       const initiateOffer = async () => {
         try {
@@ -296,7 +354,7 @@ export function useKitaComEngine({
     }
 
     return pc;
-  }, []);
+  }, [getOrCreateSilentTrack]);
 
   // Screen Wake Lock
   const requestWakeLock = useCallback(async () => {
@@ -458,7 +516,7 @@ export function useKitaComEngine({
         // Suara HANYA masuk dan direspons jika Mode Siaga AKTIF dan bukan diri kita sendiri yang sedang bicara
         if (!isMeSpeaking && isDutyActiveRef.current) {
           setIsReceiving(true);
-          // Buka suara remote audio elements seketika
+          // Buka suara SEMUA remote audio elements seketika
           remoteAudioElementsRef.current.forEach((audioEl) => {
             audioEl.muted = false;
             audioEl.volume = 1.0;
@@ -544,13 +602,13 @@ export function useKitaComEngine({
       }
     });
 
-    // WebRTC Signaling: Offer (dengan Perfect Negotiation)
+    // WebRTC Signaling: Offer (dengan rollback anti-glare)
     socket.on('webrtc:offer', async (data: { fromSocketId: string; offer: RTCSessionDescriptionInit }) => {
       try {
         console.log('[KitaCom WebRTC] Menerima offer dari:', data.fromSocketId);
         const pc = createPeerConnection(data.fromSocketId, false, socket);
         
-        // Perfect Negotiation Collision check:
+        // Perfect Negotiation Collision handling:
         const isPolite = socket.id > data.fromSocketId;
         const isMakingOffer = makingOfferRef.current.get(data.fromSocketId) || false;
         const offerCollision = isMakingOffer || pc.signalingState !== 'stable';
@@ -559,6 +617,10 @@ export function useKitaComEngine({
           if (!isPolite) {
             console.log('[KitaCom WebRTC] Mengabaikan collision offer dari peer impolite');
             return;
+          }
+          // Peer sopan: rollback local description sebelum menerima offer remote
+          if (pc.signalingState === 'have-local-offer') {
+            await pc.setLocalDescription({ type: 'rollback' });
           }
         }
 
@@ -587,8 +649,10 @@ export function useKitaComEngine({
       try {
         console.log('[KitaCom WebRTC] Menerima answer dari:', data.fromSocketId);
         const pc = peerConnectionsRef.current.get(data.fromSocketId);
-        if (pc && pc.signalingState === 'have-local-offer') {
-          await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        if (pc) {
+          if (pc.signalingState === 'have-local-offer') {
+            await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+          }
 
           // Flush any queued ICE candidates
           const queued = pendingCandidatesRef.current.get(data.fromSocketId) || [];
@@ -653,6 +717,10 @@ export function useKitaComEngine({
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(t => t.stop());
         localStreamRef.current = null;
+      }
+      if (silentStreamRef.current) {
+        silentStreamRef.current.getTracks().forEach(t => t.stop());
+        silentStreamRef.current = null;
       }
 
       socket.off();
