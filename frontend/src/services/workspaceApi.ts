@@ -43,34 +43,84 @@ export interface WorkspaceChannel {
 }
 
 export const workspaceApi = {
-  async getWorkspaces(): Promise<WorkspaceItem[]> {
-    const res = await fetch(`${API_BASE}/workspaces`);
+  // --- Pairing Channel Methods ---
+  async createPairingChannel(name: string, requestedCode?: string, createdBy?: string): Promise<{ code: string; name: string }> {
+    const res = await fetch(`${API_BASE}/channels/pairing/create`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, requestedCode, createdBy })
+    });
     const data = await res.json();
-    return data.workspaces || [];
+    if (!res.ok || !data.success) throw new Error(data.error || 'Gagal membuat saluran pairing');
+    return data.channel;
+  },
+
+  async getPairingChannel(code: string): Promise<any> {
+    const res = await fetch(`${API_BASE}/channels/pairing/${encodeURIComponent(code)}`);
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || 'Saluran tidak ditemukan');
+    return data.channel;
+  },
+
+  async getPairingChannels(): Promise<Array<{ code: string; name: string; memberCount: number }>> {
+    try {
+      const res = await fetch(`${API_BASE}/channels/pairing`);
+      const data = await res.json();
+      return data.channels || [];
+    } catch (e) {
+      return [];
+    }
+  },
+
+  // --- Legacy Workspace Methods ---
+  async getWorkspaces(): Promise<WorkspaceItem[]> {
+    try {
+      const res = await fetch(`${API_BASE}/workspaces`);
+      const data = await res.json();
+      return data.workspaces || [];
+    } catch (e) {
+      return [];
+    }
   },
 
   async getUserWorkspaces(profileId: string): Promise<WorkspaceItem[]> {
-    const res = await fetch(`${API_BASE}/users/${profileId}/workspaces`);
-    const data = await res.json();
-    return data.workspaces || [];
+    try {
+      const res = await fetch(`${API_BASE}/users/${profileId}/workspaces`);
+      const data = await res.json();
+      return data.workspaces || [];
+    } catch (e) {
+      return [];
+    }
   },
 
   async getUserByEmail(email: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/users/by-email/${encodeURIComponent(email)}`);
-    const data = await res.json();
-    return data.profile || null;
+    try {
+      const res = await fetch(`${API_BASE}/users/by-email/${encodeURIComponent(email)}`);
+      const data = await res.json();
+      return data.profile || null;
+    } catch (e) {
+      return null;
+    }
   },
 
   async getWorkspaceMembers(orgId: string): Promise<WorkspaceMember[]> {
-    const res = await fetch(`${API_BASE}/workspaces/${orgId}/members`);
-    const data = await res.json();
-    return data.members || [];
+    try {
+      const res = await fetch(`${API_BASE}/workspaces/${orgId}/members`);
+      const data = await res.json();
+      return data.members || [];
+    } catch (e) {
+      return [];
+    }
   },
 
   async getWorkspaceChannels(orgId: string): Promise<WorkspaceChannel[]> {
-    const res = await fetch(`${API_BASE}/workspaces/${orgId}/channels`);
-    const data = await res.json();
-    return data.channels || [];
+    try {
+      const res = await fetch(`${API_BASE}/workspaces/${orgId}/channels`);
+      const data = await res.json();
+      return data.channels || [];
+    } catch (e) {
+      return [];
+    }
   },
 
   async createChannel(orgId: string, payload: {

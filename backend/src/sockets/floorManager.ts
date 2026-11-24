@@ -6,9 +6,10 @@ class FloorControlManager {
   private readonly MAX_TOT_SECONDS = 60; // 60 detik Time-Out Timer
 
   public initChannelFloor(channelId: string) {
-    if (!this.floors.has(channelId)) {
-      this.floors.set(channelId, {
-        channelId,
+    const cleanId = channelId.toUpperCase().trim();
+    if (!this.floors.has(cleanId)) {
+      this.floors.set(cleanId, {
+        channelId: cleanId,
         status: 'IDLE',
         speakerId: null,
         speakerSocketId: null,
@@ -20,8 +21,9 @@ class FloorControlManager {
   }
 
   public getFloorState(channelId: string): ChannelFloorState {
-    this.initChannelFloor(channelId);
-    return this.floors.get(channelId)!;
+    const cleanId = channelId.toUpperCase().trim();
+    this.initChannelFloor(cleanId);
+    return this.floors.get(cleanId)!;
   }
 
   public requestFloor(
@@ -29,7 +31,8 @@ class FloorControlManager {
     io: Server, 
     onTotExpire: (channelId: string, speakerId: string) => void
   ): { granted: boolean; reason?: string; preemptedUser?: string | null } {
-    const { channelId, userId, socketId, userName, role, isPriority } = payload;
+    const channelId = payload.channelId.toUpperCase().trim();
+    const { userId, socketId, userName, role, isPriority } = payload;
     this.initChannelFloor(channelId);
     const floor = this.floors.get(channelId)!;
 
@@ -97,36 +100,46 @@ class FloorControlManager {
   }
 
   public releaseFloor(channelId: string, socketIdOrUserId: string): boolean {
-    const floor = this.floors.get(channelId);
+    const cleanId = channelId.toUpperCase().trim();
+    const floor = this.floors.get(cleanId);
     if (!floor) return false;
 
-    // Pemegang lock sah (dicocokkan via socketId atau userId)
-    if (floor.status === 'LOCKED' && (floor.speakerSocketId === socketIdOrUserId || floor.speakerId === socketIdOrUserId)) {
-      if (floor.totTimeout) clearTimeout(floor.totTimeout);
+    // Pemegang lock sah (dicocokkan via socketId atau userId atau FORCE_RELEASE)
+    if (floor.status === 'LOCKED') {
+      const isOwner = !socketIdOrUserId || 
+                      socketIdOrUserId === 'FORCE' ||
+                      (floor.speakerSocketId && floor.speakerSocketId === socketIdOrUserId) ||
+                      (floor.speakerId && floor.speakerId === socketIdOrUserId);
 
-      floor.status = 'IDLE';
-      floor.speakerId = null;
-      floor.speakerSocketId = null;
-      floor.speakerName = null;
-      floor.role = null;
-      floor.startedAt = null;
-      floor.totTimeout = undefined;
-      return true;
+      if (isOwner) {
+        if (floor.totTimeout) clearTimeout(floor.totTimeout);
+
+        floor.status = 'IDLE';
+        floor.speakerId = null;
+        floor.speakerSocketId = null;
+        floor.speakerName = null;
+        floor.role = null;
+        floor.startedAt = null;
+        floor.totTimeout = undefined;
+        return true;
+      }
     }
     return false;
   }
 
   public canTransmitAudio(channelId: string, socketIdOrUserId: string): boolean {
-    const floor = this.floors.get(channelId);
+    const cleanId = channelId.toUpperCase().trim();
+    const floor = this.floors.get(cleanId);
     if (!floor || floor.status !== 'LOCKED') return false;
     return floor.speakerSocketId === socketIdOrUserId || floor.speakerId === socketIdOrUserId;
   }
 
   public toBroadcastState(channelId: string): FloorBroadcastState {
-    const floor = this.getFloorState(channelId);
+    const cleanId = channelId.toUpperCase().trim();
+    const floor = this.getFloorState(cleanId);
     return {
       status: floor.status,
-      channelId,
+      channelId: cleanId,
       speakerId: floor.speakerId,
       speakerSocketId: floor.speakerSocketId,
       speakerName: floor.speakerName,

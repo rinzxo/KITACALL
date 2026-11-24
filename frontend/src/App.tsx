@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { LoginPage } from './components/auth/LoginPage';
 import { HeaderBanner } from './components/tactical/HeaderBanner';
 import { ChannelSelector } from './components/tactical/ChannelSelector';
@@ -6,21 +6,14 @@ import { GiantPTTButton } from './components/tactical/GiantPTTButton';
 import { SecurityRoster } from './components/tactical/SecurityRoster';
 import { TacticalBlackoutMode } from './components/tactical/TacticalBlackoutMode';
 import { EmergencyModal } from './components/tactical/EmergencyModal';
-import { WorkspaceSwitcher } from './components/workspace/WorkspaceSwitcher';
-import { CreateChannelModal } from './components/workspace/CreateChannelModal';
-import { ChannelMembersModal } from './components/workspace/ChannelMembersModal';
+import { PairingChannelModal, type SavedChannel } from './components/tactical/PairingChannelModal';
 import { UserProfileModal } from './components/auth/UserProfileModal';
 import { LockscreenPermissionModal } from './components/tactical/LockscreenPermissionModal';
 import { useKitaComEngine } from './hooks/useKitaComEngine';
 import type { ChannelMember } from './hooks/useKitaComEngine';
 import { workspaceApi } from './services/workspaceApi';
-import type { 
-  WorkspaceItem, 
-  WorkspaceMember, 
-  WorkspaceChannel 
-} from './services/workspaceApi';
 import { supabase } from './lib/supabase';
-import { Megaphone, X, PhoneCall, WarningCircle, Broadcast } from '@phosphor-icons/react';
+import { Megaphone, X, PhoneCall } from '@phosphor-icons/react';
 
 interface AuthenticatedUser {
   userId: string;
@@ -31,29 +24,73 @@ interface AuthenticatedUser {
   posJaga: string;
 }
 
+const DEFAULT_SAVED_CHANNELS: SavedChannel[] = [
+  { code: 'CH-01', name: 'Saluran Umum Utama', lastJoined: Date.now() },
+  { code: 'CH-02', name: 'Saluran Komando Lapangan', lastJoined: Date.now() }
+];
+
 export function App() {
   // 1. Auth State: WAJIB LOGIN DULU (Null jika belum login)
   const [currentUser, setCurrentUser] = useState<AuthenticatedUser | null>(null);
   const [isCheckingSession, setIsCheckingSession] = useState(true);
 
-  // 2. Workspace State (HANYA workspace milik user yang sedang login)
-  const [userWorkspaces, setUserWorkspaces] = useState<WorkspaceItem[]>([]);
-  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceItem | null>(null);
-  const [isLoadingWorkspaces, setIsLoadingWorkspaces] = useState(false);
+  // 2. Channel & Pairing State (Berbasis Pairing Code, bukan Workspace)
+  const [currentChannelCode, setCurrentChannelCode] = useState<string>(() => {
+    return localStorage.getItem('kitacall_active_channel_code') || 'CH-01';
+  });
+  const [currentChannelName, setCurrentChannelName] = useState<string>(() => {
+    return localStorage.getItem('kitacall_active_channel_name') || 'Saluran Umum Utama';
+  });
+  const [savedChannels, setSavedChannels] = useState<SavedChannel[]>(() => {
+    try {
+      const stored = localStorage.getItem('kitacall_saved_channels');
+      if (stored) return JSON.parse(stored);
+    } catch (e) {}
+    return DEFAULT_SAVED_CHANNELS;
+  });
 
-  // 3. Channels & Members of active workspace
-  const [workspaceMembers, setWorkspaceMembers] = useState<WorkspaceMember[]>([]);
-  const [channels, setChannels] = useState<WorkspaceChannel[]>([]);
-  const [currentChannelId, setCurrentChannelId] = useState<string>('');
-
-  // 4. Modals State
+  // 3. Modals State
+  const [isPairingModalOpen, setIsPairingModalOpen] = useState(false);
   const [isBlackoutOpen, setIsBlackoutOpen] = useState(false);
   const [isEmergencyModalOpen, setIsEmergencyModalOpen] = useState(false);
-  const [isCreateChannelOpen, setIsCreateChannelOpen] = useState(false);
-  const [isManageMembersOpen, setIsManageMembersOpen] = useState(false);
   const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
   const [isLockscreenModalOpen, setIsLockscreenModalOpen] = useState(false);
   const [directCallTarget, setDirectCallTarget] = useState<ChannelMember | null>(null);
+
+  // Simpan riwayat saluran ke localStorage setiap kali ada pembaruan
+  const persistSavedChannels = (updated: SavedChannel[]) => {
+    setSavedChannels(updated);
+    try {
+      localStorage.setItem('kitacall_saved_channels', JSON.stringify(updated));
+    } catch (e) {}
+  };
+
+  // Handler memilih / pairing ke saluran baru
+  const handleSelectChannel = (channel: { code: string; name: string }) => {
+    const cleanCode = channel.code.toUpperCase().trim();
+    setCurrentChannelCode(cleanCode);
+    setCurrentChannelName(channel.name);
+    try {
+      localStorage.setItem('kitacall_active_channel_code', cleanCode);
+      localStorage.setItem('kitacall_active_channel_name', channel.name);
+    } catch (e) {}
+
+    // Tambahkan atau perbarui di daftar saluran tersimpan
+    const existingIndex = savedChannels.findIndex(c => c.code === cleanCode);
+    let updated: SavedChannel[];
+    if (existingIndex >= 0) {
+      updated = savedChannels.map((c, i) => i === existingIndex ? { ...c, name: channel.name, lastJoined: Date.now() } : c);
+    } else {
+      updated = [{ code: cleanCode, name: channel.name, lastJoined: Date.now() }, ...savedChannels];
+    }
+    persistSavedChannels(updated);
+  };
+
+  // Handler menghapus saluran dari riwayat
+  const handleRemoveSavedChannel = (code: string) => {
+    const updated = savedChannels.filter(c => c.code !== code);
+    persistSavedChannels(updated);
+  };
 
   // Otomatis tawarkan izin Lockscreen HP jika belum diaktifkan (khusus Android 13+ & Mobile)
   useEffect(() => {
@@ -76,8 +113,8 @@ export function App() {
           const u = session.user;
           let profileName = u.user_metadata?.full_name || u.email?.split('@')[0] || 'Pengguna';
           let avatarUrl = u.user_metadata?.avatar_url || null;
-
           let actualUserId = u.id;
+
           try {
             const remoteProfile = await workspaceApi.getUserByEmail(u.email || '');
             if (remoteProfile) {
@@ -131,74 +168,11 @@ export function App() {
         });
       } else {
         setCurrentUser(null);
-        setUserWorkspaces([]);
-        setActiveWorkspace(null);
       }
     });
 
     return () => subscription.unsubscribe();
   }, []);
-
-  // Begitu user login, muat HANYA workspace milik user tersebut!
-  useEffect(() => {
-    if (!currentUser) return;
-
-    async function loadUserWorkspaces() {
-      try {
-        setIsLoadingWorkspaces(true);
-        const wsList = await workspaceApi.getUserWorkspaces(currentUser.userId);
-        setUserWorkspaces(wsList);
-        if (wsList.length > 0) {
-          setActiveWorkspace(wsList[0]);
-        } else {
-          setActiveWorkspace(null);
-        }
-      } catch (err) {
-        console.error('[KitaCom] Gagal memuat workspace user:', err);
-      } finally {
-        setIsLoadingWorkspaces(false);
-      }
-    }
-
-    loadUserWorkspaces();
-  }, [currentUser?.userId]);
-
-  // Muat channels dan members ketika activeWorkspace berganti
-  const loadWorkspaceDetails = useCallback(async (orgId: string, currentUserId: string) => {
-    try {
-      const [membersData, channelsData] = await Promise.all([
-        workspaceApi.getWorkspaceMembers(orgId),
-        workspaceApi.getWorkspaceChannels(orgId)
-      ]);
-
-      setWorkspaceMembers(membersData);
-      setChannels(channelsData);
-
-      if (channelsData.length > 0) {
-        setCurrentChannelId(channelsData[0].id);
-      }
-
-      // Tentukan peran taktis berdasarkan jabatan riil di organisasi
-      const myMembership = membersData.find(m => m.profileId === currentUserId);
-      if (myMembership) {
-        const isHead = myMembership.orgRole === 'head' || myMembership.orgRole === 'vice_head';
-        setCurrentUser(prev => prev ? ({
-          ...prev,
-          userName: myMembership.fullName || prev.userName,
-          role: isHead ? 'KOORDINATOR_KEAMANAN' : 'ANGGOTA_KEAMANAN',
-          posJaga: isHead ? 'Posko Induk & Komando' : 'Patroli Lapangan'
-        }) : null);
-      }
-    } catch (err) {
-      console.error('[KitaCom] Gagal memuat data workspace detail:', err);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (activeWorkspace && currentUser) {
-      loadWorkspaceDetails(activeWorkspace.id, currentUser.userId);
-    }
-  }, [activeWorkspace, currentUser?.userId, loadWorkspaceDetails]);
 
   // Handler Login Sukses dari LoginPage
   const handleLoginSuccess = (userPayload: {
@@ -221,81 +195,26 @@ export function App() {
   const handleSignOut = async () => {
     await supabase.auth.signOut();
     setCurrentUser(null);
-    setUserWorkspaces([]);
-    setActiveWorkspace(null);
-    setChannels([]);
-    setWorkspaceMembers([]);
     setIsProfileModalOpen(false);
   };
 
-  // Handler pembuatan channel baru
-  const handleCreateChannel = async (channelData: {
-    code: string;
-    name: string;
-    category: string;
-    description: string;
-    initialMembers: { profileId: string; tacticalRole: string; posJaga: string }[];
-  }) => {
-    if (!activeWorkspace || !currentUser) return;
-    const newChan = await workspaceApi.createChannel(activeWorkspace.id, {
-      ...channelData,
-      createdBy: currentUser.userId,
-      initialMemberIds: channelData.initialMembers
-    });
-
-    const updatedChannels = await workspaceApi.getWorkspaceChannels(activeWorkspace.id);
-    setChannels(updatedChannels);
-    setCurrentChannelId(newChan.id);
-  };
-
-  // Handler penugasan anggota ke channel
-  const handleAddMemberToChannel = async (payload: {
-    profileId: string;
-    tacticalRole: string;
-    posJaga: string;
-  }) => {
-    if (!currentChannelId || !activeWorkspace) return;
-    await workspaceApi.addMemberToChannel(currentChannelId, payload);
-    const updatedChannels = await workspaceApi.getWorkspaceChannels(activeWorkspace.id);
-    setChannels(updatedChannels);
-  };
-
-  // Handler pencabutan anggota dari channel
-  const handleRemoveMemberFromChannel = async (profileId: string) => {
-    if (!currentChannelId || !activeWorkspace) return;
-    await workspaceApi.removeMemberFromChannel(currentChannelId, profileId);
-    const updatedChannels = await workspaceApi.getWorkspaceChannels(activeWorkspace.id);
-    setChannels(updatedChannels);
-  };
-
-  const activeChannelObj = channels.find(c => c.id === currentChannelId || c.code === currentChannelId) || null;
-
-  // Filter saluran yang berhak diakses user untuk navigasi lockscreen HP (ala Spotify)
-  const accessibleChannels = channels.filter(c => {
-    if (!currentUser) return false;
-    const isPublic = c.code === 'CH-01' || !c.assignedMembers || c.assignedMembers.length === 0;
-    const isCommander = currentUser.role === 'KOORDINATOR_KEAMANAN' || currentUser.role === 'KETUA_PELAKSANA';
-    return isPublic || isCommander || c.assignedMembers.some(m => m.profileId === currentUser.userId);
-  });
-
-  const channelsForLockscreen = accessibleChannels.length > 0 ? accessibleChannels : channels;
-
-  const handleSelectChannelFromLockscreen = (targetId: string) => {
-    setCurrentChannelId(targetId);
-  };
-
-  // Engine audio & socket (Hanya aktif untuk user terautentikasi)
+  // Engine audio & socket
   const engineProps = currentUser ? {
-    workspaceId: activeWorkspace ? activeWorkspace.id : 'ws-unassigned',
-    channelId: currentChannelId || 'CH-01',
-    channelName: activeChannelObj?.name || 'Saluran Utama',
-    channelCode: activeChannelObj?.code || 'CH-01',
-    channels: channelsForLockscreen.map(c => ({ id: c.id, code: c.code, name: c.name })),
-    onSelectChannel: handleSelectChannelFromLockscreen,
-    workspaceName: activeWorkspace?.name || 'KitaCall Network',
+    workspaceId: 'pairing-network',
+    channelId: currentChannelCode,
+    channelName: currentChannelName,
+    channelCode: currentChannelCode,
+    channels: savedChannels.map(c => ({ id: c.code, code: c.code, name: c.name })),
+    onSelectChannel: (targetCode: string) => {
+      const found = savedChannels.find(c => c.code === targetCode);
+      handleSelectChannel({
+        code: targetCode,
+        name: found ? found.name : `Saluran ${targetCode}`
+      });
+    },
+    workspaceName: currentChannelName,
     user: currentUser
   } : {
-    workspaceId: 'ws-unassigned',
     channelId: 'CH-01',
     channelName: 'Saluran Publik',
     channelCode: 'CH-01',
@@ -315,6 +234,7 @@ export function App() {
     activateLockscreen,
     floorState,
     roster,
+    currentSocketId,
     isTransmitting,
     isReceiving,
     startTransmitting,
@@ -341,12 +261,12 @@ export function App() {
     );
   }
 
-  // 2. WAJIB LOGIN DULU: Tanpa bypass atau backdoor
+  // 2. WAJIB LOGIN DULU
   if (!currentUser) {
     return <LoginPage onLoginSuccess={handleLoginSuccess} />;
   }
 
-  // 3. User terautentikasi: Tampilkan antarmuka taktis
+  // 3. User terautentikasi: Tampilkan antarmuka transceiver taktis
   return (
     <div className="h-screen max-h-screen bg-slate-950 flex justify-center font-sans select-none overflow-hidden">
       {/* Handheld Walkie-Talkie Chassis Frame */}
@@ -364,7 +284,7 @@ export function App() {
           onOpenLockscreenModal={() => setIsLockscreenModalOpen(true)}
           userRole={currentUser.role}
           userName={currentUser.userName}
-          workspaceName={activeWorkspace?.name}
+          workspaceName={currentChannelName}
         />
 
         {/* Emergency Active Broadcast Bar */}
@@ -386,38 +306,12 @@ export function App() {
           </div>
         )}
 
-        {/* 2. Workspace Selector */}
-        <WorkspaceSwitcher
-          workspaces={userWorkspaces}
-          activeWorkspace={activeWorkspace}
-          onSelectWorkspace={setActiveWorkspace}
-          isLoading={isLoadingWorkspaces}
-        />
-
-        {/* Jika user belum memiliki workspace */}
-        {userWorkspaces.length === 0 && !isLoadingWorkspaces && (
-          <div className="max-w-md mx-auto px-4 mt-4 w-full">
-            <div className="bg-amber-950/80 border border-amber-500/50 p-4 rounded-2xl flex items-start gap-3 text-amber-200 text-xs font-mono-lcd">
-              <WarningCircle size={20} weight="fill" className="text-amber-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="font-extrabold mb-1 uppercase font-tactical">Belum Terdaftar di Organisasi</p>
-                <p className="leading-relaxed text-amber-300/90">
-                  Akun Anda ({currentUser.email}) belum terdaftar pada divisi/workspace apa pun di KitaCall. Silakan hubungi admin untuk menambahkan akun Anda ke organisasi.
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* 3. Frequency Channel Selector (Saluran Taktis di Workspace Aktif) */}
+        {/* 2. Channel Selector via Pairing Code */}
         <ChannelSelector
-          currentChannelId={currentChannelId}
-          onSelectChannel={setCurrentChannelId}
-          channels={channels}
-          userRole={currentUser.role}
-          currentUserId={currentUser.userId}
-          onOpenCreateChannel={() => setIsCreateChannelOpen(true)}
-          onOpenManageMembers={() => setIsManageMembersOpen(true)}
+          currentChannelCode={currentChannelCode}
+          currentChannelName={currentChannelName}
+          memberCount={roster.length}
+          onOpenPairingModal={() => setIsPairingModalOpen(true)}
         />
 
         {/* Direct Call notification banner */}
@@ -438,77 +332,72 @@ export function App() {
           </div>
         )}
 
-      {/* 4. Center Giant PTT Button */}
-      <GiantPTTButton
-        floorState={floorState}
-        isTransmitting={isTransmitting}
-        isReceiving={isReceiving}
-        currentUserId={currentUser.userId}
-        userRole={currentUser.role}
-        onStartTransmit={startTransmitting}
-        onStopTransmit={stopTransmitting}
-        isDutyActive={isDutyActive}
-        onActivateDutyFirst={toggleDutyMode}
-      />
+        {/* 3. Center Giant PTT Button */}
+        <GiantPTTButton
+          floorState={floorState}
+          isTransmitting={isTransmitting}
+          isReceiving={isReceiving}
+          currentUserId={currentUser.userId}
+          currentSocketId={currentSocketId}
+          userRole={currentUser.role}
+          onStartTransmit={startTransmitting}
+          onStopTransmit={stopTransmitting}
+          isDutyActive={isDutyActive}
+          onActivateDutyFirst={toggleDutyMode}
+        />
 
-      {/* 5. Security Roster Drawer (Real-Time Personel di Frekuensi Aktif) */}
-      <SecurityRoster
-        roster={roster}
-        currentUserId={currentUser.userId}
-        onDirectCall={(member) => setDirectCallTarget(member)}
-      />
+        {/* 4. Security Roster Drawer (Real-Time Personel di Frekuensi Aktif) */}
+        <SecurityRoster
+          roster={roster}
+          currentUserId={currentUser.userId}
+          onDirectCall={(member) => setDirectCallTarget(member)}
+        />
 
-      {/* 6. Tactical Blackout Mode Modal (Pure AMOLED #000000) */}
-      <TacticalBlackoutMode
-        isOpen={isBlackoutOpen}
-        onClose={() => setIsBlackoutOpen(false)}
-        channelId={activeChannelObj ? activeChannelObj.code : currentChannelId}
-        floorState={floorState}
-        isReceiving={isReceiving}
-        batteryLevel={batteryLevel}
-      />
+        {/* 5. Tactical Blackout Mode Modal (Pure AMOLED #000000) */}
+        <TacticalBlackoutMode
+          isOpen={isBlackoutOpen}
+          onClose={() => setIsBlackoutOpen(false)}
+          channelId={currentChannelCode}
+          floorState={floorState}
+          isReceiving={isReceiving}
+          batteryLevel={batteryLevel}
+        />
 
-      {/* 7. Emergency Broadcast Modal */}
-      <EmergencyModal
-        isOpen={isEmergencyModalOpen}
-        onClose={() => setIsEmergencyModalOpen(false)}
-        onConfirm={(note) => triggerEmergencyAlert(note)}
-        channelId={activeChannelObj ? activeChannelObj.code : currentChannelId}
-      />
+        {/* 6. Emergency Broadcast Modal */}
+        <EmergencyModal
+          isOpen={isEmergencyModalOpen}
+          onClose={() => setIsEmergencyModalOpen(false)}
+          onConfirm={(note) => triggerEmergencyAlert(note)}
+          channelId={currentChannelCode}
+        />
 
-      {/* 8. Create Channel Modal */}
-      <CreateChannelModal
-        isOpen={isCreateChannelOpen}
-        onClose={() => setIsCreateChannelOpen(false)}
-        workspaceMembers={workspaceMembers}
-        onCreateChannel={handleCreateChannel}
-      />
+        {/* 7. Pairing Channel Modal (Gabung, Buat Saluran & Riwayat) */}
+        <PairingChannelModal
+          isOpen={isPairingModalOpen}
+          onClose={() => setIsPairingModalOpen(false)}
+          currentChannelCode={currentChannelCode}
+          currentChannelName={currentChannelName}
+          savedChannels={savedChannels}
+          onSelectChannel={handleSelectChannel}
+          onRemoveSavedChannel={handleRemoveSavedChannel}
+          userId={currentUser.userId}
+        />
 
-      {/* 9. Manage Channel Members Modal */}
-      <ChannelMembersModal
-        isOpen={isManageMembersOpen}
-        onClose={() => setIsManageMembersOpen(false)}
-        channel={activeChannelObj}
-        workspaceMembers={workspaceMembers}
-        onAddMember={handleAddMemberToChannel}
-        onRemoveMember={handleRemoveMemberFromChannel}
-      />
+        {/* 8. Profil & Keluar Sesi Modal */}
+        <UserProfileModal
+          isOpen={isProfileModalOpen}
+          onClose={() => setIsProfileModalOpen(false)}
+          currentUser={currentUser}
+          activeWorkspaceName={currentChannelName}
+          onSignOut={handleSignOut}
+        />
 
-      {/* 10. Profil & Keluar Sesi Modal (Tanpa opsi alih identitas) */}
-      <UserProfileModal
-        isOpen={isProfileModalOpen}
-        onClose={() => setIsProfileModalOpen(false)}
-        currentUser={currentUser}
-        activeWorkspaceName={activeWorkspace?.name}
-        onSignOut={handleSignOut}
-      />
-
-      {/* 11. Modal Izin Lockscreen HP (Otomatis & 1-Klik) */}
-      <LockscreenPermissionModal
-        isOpen={isLockscreenModalOpen}
-        onClose={() => setIsLockscreenModalOpen(false)}
-        onActivate={activateLockscreen}
-      />
+        {/* 9. Modal Izin Lockscreen HP (Otomatis & 1-Klik) */}
+        <LockscreenPermissionModal
+          isOpen={isLockscreenModalOpen}
+          onClose={() => setIsLockscreenModalOpen(false)}
+          onActivate={activateLockscreen}
+        />
       </div>
     </div>
   );

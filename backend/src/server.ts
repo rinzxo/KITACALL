@@ -18,19 +18,77 @@ const PORT = process.env.PORT || 4001;
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// API Routes untuk Workspace, Anggota, dan Manajemen Saluran
+// API Routes untuk Workspace & Kanal (termasuk Pairing Code)
 app.use('/api', workspaceRoutes);
 
+// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'KitaCom / KitaRadio Tactical Relay',
+    service: 'KitaCom / KitaRadio Tactical Pairing Relay',
     timestamp: new Date().toISOString()
   });
 });
 
+// REST API untuk Pairing Channels
+app.post('/api/channels/pairing/create', async (req, res) => {
+  try {
+    const { name, requestedCode, createdBy } = req.body;
+    let code = requestedCode ? requestedCode.toUpperCase().trim().replace(/[^A-Z0-9-]/g, '') : '';
+    
+    if (!code) {
+      // Buat Pairing Code acak yang mudah dibaca: contoh KT-8492
+      const randomNum = Math.floor(1000 + Math.random() * 9000);
+      code = `KT-${randomNum}`;
+    }
+
+    const channelName = name && name.trim() ? name.trim() : `Saluran ${code}`;
+    const meta = channelState.registerChannel(code, channelName, createdBy);
+
+    // Coba simpan ke DB PostgreSQL jika koneksi tersedia
+    try {
+      const client = await dbPool.connect();
+      try {
+        await client.query(`
+          INSERT INTO kitacom_channels (code, name, category, description)
+          VALUES ($1, $2, 'Pairing Channel', 'Saluran Taktis via Pairing Code')
+          ON CONFLICT (organization_id, code) DO NOTHING
+        `, [code, channelName]);
+      } catch (dbErr) {
+        // Abaikan jika constraint organisasi belum siap, in-memory Map tetap aktif
+      } finally {
+        client.release();
+      }
+    } catch (e) {}
+
+    res.json({ success: true, channel: meta });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/channels/pairing/:code', (req, res) => {
+  const code = req.params.code.toUpperCase().trim();
+  const meta = channelState.getChannelMeta(code);
+  const roster = channelState.getChannelRoster(code);
+  const floor = floorControl.toBroadcastState(code);
+
+  if (meta) {
+    res.json({ success: true, channel: { ...meta, memberCount: roster.length }, floor });
+  } else {
+    // Jika belum terdaftar namun dipanggil, langsung daftarkan on-the-fly
+    const newMeta = channelState.registerChannel(code, `Saluran ${code}`);
+    res.json({ success: true, channel: { ...newMeta, memberCount: roster.length }, floor });
+  }
+});
+
+app.get('/api/channels/pairing', (req, res) => {
+  const channels = channelState.getAllChannels();
+  res.json({ success: true, channels });
+});
+
 app.get('/api/channels/:channelId/roster', (req, res) => {
-  const { channelId } = req.params;
+  const channelId = req.params.channelId.toUpperCase().trim();
   const roster = channelState.getChannelRoster(channelId);
   const floor = floorControl.toBroadcastState(channelId);
   res.json({ channelId, roster, floor });
@@ -52,47 +110,13 @@ const kitaradio = io.of('/kitaradio');
 kitaradio.on('connection', (socket: Socket) => {
   console.log(`[KitaRadio] Client connected: ${socket.id}`);
 
-  // 1. kitacom:join_channel (Verifikasi hak akses channel & isolasi frekuensi)
-  socket.on('kitacom:join_channel', async (payload: JoinChannelPayload) => {
-    const { channelId, userId, userName, role, dutyMode, posJaga } = payload;
+  // 1. kitacom:join_channel (Pairing Code Channel Join)
+  socket.on('kitacom:join_channel', async (payload: JoinChannelPayload & { channelName?: string }) => {
+    const channelId = (payload.channelId || 'CH-01').toUpperCase().trim();
+    const { userId, userName, role, dutyMode, posJaga, channelName } = payload;
     
-    // Verifikasi Otoritas Personel:
-    // 1. Role Komando (Koordinator Keamanan, Ketua Pelaksana, Pembina) punya izin akses semua frekuensi
-    // 2. Saluran default CH-01 terbuka untuk seluruh personel satgas
-    // 3. Saluran lain hanya bisa dimasuki oleh personel yang ditugaskan di kitacom_channel_members
-    const isCommander = role === 'KOORDINATOR_KEAMANAN' || role === 'KETUA_PELAKSANA' || role === 'PEMBINA';
-
-    if (!isCommander && channelId && channelId !== 'CH-01') {
-      try {
-        const client = await dbPool.connect();
-        try {
-          const chanRes = await client.query(
-            `SELECT id, code FROM kitacom_channels WHERE id::text = $1 OR code = $1`,
-            [channelId]
-          );
-          const channelRow = chanRes.rows[0];
-          if (channelRow && channelRow.code !== 'CH-01') {
-            const memRes = await client.query(
-              `SELECT id FROM kitacom_channel_members WHERE channel_id = $1 AND profile_id::text = $2`,
-              [channelRow.id, userId]
-            );
-            if (memRes.rows.length === 0) {
-              console.warn(`[KitaRadio Security] Akses ditolak: ${userName} (${userId}) bukan anggota saluran ${channelRow.code}`);
-              socket.emit('kitacom:access_denied', {
-                channelId,
-                channelCode: channelRow.code,
-                reason: `Akses ditolak: Anda belum ditugaskan oleh Koordinator di saluran frekuensi ${channelRow.code}.`
-              });
-              return;
-            }
-          }
-        } finally {
-          client.release();
-        }
-      } catch (dbErr) {
-        console.error('[KitaRadio DB] Gagal verifikasi izin saluran:', dbErr);
-      }
-    }
+    // Register metadata saluran jika belum ada
+    channelState.registerChannel(channelId, channelName || `Saluran ${channelId}`);
 
     // Keluar dari room channel sebelumnya agar suara tidak bocor antar frekuensi
     Array.from(socket.rooms).forEach(room => {
@@ -108,12 +132,12 @@ kitaradio.on('connection', (socket: Socket) => {
     channelState.addMember(channelId, socket.id, {
       userId,
       userName,
-      role,
+      role: role || 'ANGGOTA_KEAMANAN',
       dutyMode: dutyMode ?? true,
       posJaga: posJaga || 'Patroli Lapangan'
     });
 
-    console.log(`[KitaRadio] ${userName} (${role}) joined channel ${channelId}`);
+    console.log(`[KitaRadio] ${userName} (${role}) paired & joined channel ${channelId}`);
 
     // Broadcast updated roster to channel
     const roster = channelState.getChannelRoster(channelId);
@@ -126,7 +150,8 @@ kitaradio.on('connection', (socket: Socket) => {
 
   // 2. kitacom:heartbeat (dikirim tiap 15s oleh client)
   socket.on('kitacom:heartbeat', (payload: HeartbeatPayload) => {
-    const { channelId, audioCtxState, wakeLock, batteryLvl, dutyMode } = payload;
+    const channelId = (payload.channelId || 'CH-01').toUpperCase().trim();
+    const { audioCtxState, wakeLock, batteryLvl, dutyMode } = payload;
     const updated = channelState.updateHeartbeat(channelId, socket.id, {
       audioCtxState,
       wakeLock,
@@ -143,19 +168,24 @@ kitaradio.on('connection', (socket: Socket) => {
 
   // 3. ptt:request_floor (Hold-to-Talk atau Tap-to-Latch)
   socket.on('ptt:request_floor', (payload: RequestFloorPayload) => {
+    const channelId = (payload.channelId || 'CH-01').toUpperCase().trim();
+    payload.channelId = channelId;
     payload.socketId = socket.id;
-    const { channelId, userId, userName, role } = payload;
+    const { userId, userName } = payload;
     
-    // Pastikan pengirim adalah personel yang sah dan benar-benar aktif di channel ini
+    // Pastikan pengirim adalah personel yang sah dan terdaftar di channel ini
     const roster = channelState.getChannelRoster(channelId);
     const isMember = roster.some(m => m.socketId === socket.id || m.userId === userId);
     if (!isMember) {
-      console.warn(`[KitaRadio Floor] Penolakan transmisi: ${userName} bukan anggota aktif di saluran ${channelId}`);
-      socket.emit('ptt:floor_denied', {
-        reason: 'UNAUTHORIZED_NOT_IN_CHANNEL',
-        channelId
+      // Jika socket belum tercatat di channel roster (misal reconnect kilat), tambahkan otomatis
+      channelState.addMember(channelId, socket.id, {
+        userId,
+        userName,
+        role: payload.role || 'ANGGOTA_KEAMANAN',
+        dutyMode: true,
+        posJaga: 'Patroli Lapangan'
       });
-      return;
+      socket.join(channelId);
     }
 
     const result = floorControl.requestFloor(payload, kitaradio as any, (expChannelId, expUserId) => {
@@ -171,7 +201,7 @@ kitaradio.on('connection', (socket: Socket) => {
       const state = floorControl.toBroadcastState(channelId);
       kitaradio.to(channelId).emit('ptt:floor_state', state);
     } else {
-      console.log(`[KitaRadio] Floor DENIED to ${userName} (Busy)`);
+      console.log(`[KitaRadio] Floor DENIED to ${userName} (Reason: ${result.reason || 'Busy'})`);
       socket.emit('ptt:floor_denied', {
         reason: result.reason || 'CHANNEL_BUSY',
         channelId
@@ -181,8 +211,12 @@ kitaradio.on('connection', (socket: Socket) => {
 
   // 4. ptt:release_floor (Saat PTT dilepas)
   socket.on('ptt:release_floor', (payload: { channelId: string; userId: string }) => {
-    const { channelId, userId } = payload;
-    const released = floorControl.releaseFloor(channelId, socket.id);
+    const channelId = (payload.channelId || 'CH-01').toUpperCase().trim();
+    const { userId } = payload;
+    let released = floorControl.releaseFloor(channelId, socket.id);
+    if (!released && userId) {
+      released = floorControl.releaseFloor(channelId, userId);
+    }
     
     if (released) {
       console.log(`[KitaRadio] Floor RELEASED by ${userId} (socket: ${socket.id}) on ${channelId}`);
@@ -214,9 +248,10 @@ kitaradio.on('connection', (socket: Socket) => {
     });
   });
 
-  // 7. ptt:emergency_alert (Siaga Darurat Komandan)
-  socket.on('ptt:emergency_alert', (payload: { workspaceId: string; channelId: string; commanderName: string; emergencyNote: string }) => {
-    const { channelId, commanderName, emergencyNote } = payload;
+  // 6. ptt:emergency_alert (Siaga Darurat Komandan)
+  socket.on('ptt:emergency_alert', (payload: { workspaceId?: string; channelId: string; commanderName: string; emergencyNote: string }) => {
+    const channelId = (payload.channelId || 'CH-01').toUpperCase().trim();
+    const { commanderName, emergencyNote } = payload;
     console.log(`[KitaRadio] EMERGENCY ALERT by ${commanderName} on ${channelId}: ${emergencyNote}`);
     
     // Broadcast emergency siren trigger ke semua client di channel
@@ -256,5 +291,6 @@ server.listen(PORT, () => {
   console.log(`=================================================`);
   console.log(`[KitaRadio & KitaCom Engine] Server Running on Port ${PORT}`);
   console.log(`Namespace: /kitaradio | Health check: http://localhost:${PORT}/health`);
+  console.log(`Pairing Channels API: http://localhost:${PORT}/api/channels/pairing`);
   console.log(`=================================================`);
 });

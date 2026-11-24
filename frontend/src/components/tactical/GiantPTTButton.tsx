@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Microphone, Lightning, LockKey, LockKeyOpen, Power } from '@phosphor-icons/react';
+import { Microphone, Power } from '@phosphor-icons/react';
 import type { FloorBroadcastState } from '../../hooks/useKitaComEngine';
 
 interface GiantPTTButtonProps {
@@ -7,6 +7,7 @@ interface GiantPTTButtonProps {
   isTransmitting: boolean;
   isReceiving: boolean;
   currentUserId: string;
+  currentSocketId?: string;
   userRole: string;
   onStartTransmit: () => void;
   onStopTransmit: () => void;
@@ -19,6 +20,7 @@ export const GiantPTTButton: React.FC<GiantPTTButtonProps> = ({
   isTransmitting,
   isReceiving,
   currentUserId,
+  currentSocketId,
   userRole,
   onStartTransmit,
   onStopTransmit,
@@ -31,7 +33,11 @@ export const GiantPTTButton: React.FC<GiantPTTButtonProps> = ({
   const [totSecondsRemaining, setTotSecondsRemaining] = useState(60);
 
   const isCommander = userRole === 'KOORDINATOR_KEAMANAN' || userRole === 'KETUA_PELAKSANA';
-  const isChannelLockedByOther = floorState.status === 'LOCKED' && floorState.speakerId !== currentUserId;
+
+  // Periksa apakah floor sedang dikunci perangkat lain (cocokkan socketId dan userId)
+  const isChannelLockedByOther = floorState.status === 'LOCKED' && (
+    floorState.speakerSocketId ? floorState.speakerSocketId !== currentSocketId : floorState.speakerId !== currentUserId
+  );
 
   // Countdown timer saat transmisi aktif (TOT max 60s)
   useEffect(() => {
@@ -49,14 +55,28 @@ export const GiantPTTButton: React.FC<GiantPTTButtonProps> = ({
       }, 1000);
     } else {
       setTotSecondsRemaining(60);
+      setLatched(false);
     }
     return () => clearInterval(interval);
   }, [isTransmitting]);
 
-  // Handle Pointer Events (Touch, Mouse, Pen) secara seragam & tanpa ghost click
-  const handlePointerDown = (e: React.PointerEvent) => {
+  // Safeguard: Bila window blur atau tab switch saat bicara, lepas transmisi
+  useEffect(() => {
+    const handleBlur = () => {
+      if (isTransmitting) {
+        onStopTransmit();
+      }
+    };
+    window.addEventListener('blur', handleBlur);
+    return () => window.removeEventListener('blur', handleBlur);
+  }, [isTransmitting, onStopTransmit]);
+
+  // Handle Pointer Events (Touch, Mouse, Pen) dengan PointerCapture anti slip
+  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
     if (e.button !== 0 && e.pointerType === 'mouse') return;
-    e.preventDefault();
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch (err) {}
 
     if (!isDutyActive) {
       onActivateDutyFirst();
@@ -64,7 +84,7 @@ export const GiantPTTButton: React.FC<GiantPTTButtonProps> = ({
     }
 
     if (pttMode === 'HOLD') {
-      if (!isTransmitting) {
+      if (!isTransmitting && !isChannelLockedByOther) {
         onStartTransmit();
       }
     } else {
@@ -79,31 +99,28 @@ export const GiantPTTButton: React.FC<GiantPTTButtonProps> = ({
     }
   };
 
-  const handlePointerUp = (e: React.PointerEvent) => {
-    e.preventDefault();
+  const handlePointerUp = (e: React.PointerEvent<HTMLButtonElement>) => {
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch (err) {}
+
     if (pttMode === 'HOLD' && isTransmitting) {
       onStopTransmit();
     }
   };
 
-  const handlePointerCancel = (e: React.PointerEvent) => {
-    e.preventDefault();
+  const handlePointerCancel = (e: React.PointerEvent<HTMLButtonElement>) => {
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch (err) {}
+
     if (pttMode === 'HOLD' && isTransmitting) {
       onStopTransmit();
     }
-  };
-
-  // Commander Priority Override
-  const handlePriorityOverride = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (!isDutyActive) {
-      onActivateDutyFirst();
-    }
-    onStartTransmit();
   };
 
   return (
-    <div className="w-full max-w-md mx-auto px-4 flex flex-col items-center justify-center my-auto py-1">
+    <div className="w-full max-w-md mx-auto px-4 flex flex-col items-center justify-center my-auto py-1 select-none">
       {/* 1. Status Pill Minimal */}
       <div className="mb-2 text-center">
         {isChannelLockedByOther ? (
@@ -152,12 +169,8 @@ export const GiantPTTButton: React.FC<GiantPTTButtonProps> = ({
             onPointerDown={handlePointerDown}
             onPointerUp={handlePointerUp}
             onPointerCancel={handlePointerCancel}
-            onPointerLeave={() => {
-              if (pttMode === 'HOLD' && isTransmitting) {
-                onStopTransmit();
-              }
-            }}
             disabled={isChannelLockedByOther && !isCommander}
+            style={{ touchAction: 'none' }}
             className={`w-full h-full rounded-full flex flex-col items-center justify-center p-4 text-white font-extrabold select-none transition-all duration-150 transform active:scale-95 cursor-pointer relative overflow-hidden border shadow-xl ${
               !isDutyActive
                 ? 'bg-gradient-to-b from-slate-800 to-slate-950 border-slate-700'
@@ -199,74 +212,66 @@ export const GiantPTTButton: React.FC<GiantPTTButtonProps> = ({
             {/* Button Label */}
             <span className="text-base sm:text-lg font-black tracking-wider uppercase text-center px-2 z-10 font-tactical">
               {!isDutyActive
-                ? 'RADIO OFF'
+                ? 'NYALAKAN SIAGA'
                 : isTransmitting
-                ? 'BICARA...'
+                ? 'SEDANG BICARA'
                 : isReceiving
-                ? 'MENERIMA'
+                ? 'JALUR DIPAKAI'
                 : isChannelLockedByOther
-                ? 'TERISI'
-                : 'TEKAN BICARA'}
+                ? 'MENUNGGU GILIRAN'
+                : pttMode === 'HOLD'
+                ? 'TAHAN BICARA'
+                : latched
+                ? 'KETUK SELESAI'
+                : 'KETUK BICARA'}
             </span>
 
-            {/* Sub-label */}
-            <span className="text-[10px] text-white/80 font-mono-lcd mt-0.5 uppercase z-10">
+            <span className="text-[11px] font-mono-lcd text-cyan-200/80 mt-0.5 tracking-tight uppercase z-10">
               {!isDutyActive
-                ? 'Ketuk untuk Siaga'
+                ? 'Klik Tombol SIAGA di Atas'
                 : isTransmitting
-                ? 'Lepas saat selesai'
+                ? 'Lepas untuk Mengakhiri'
+                : isReceiving
+                ? (floorState.speakerName ? `${floorState.speakerName} Bicara` : 'Audio Masuk...')
                 : isChannelLockedByOther
-                ? 'Menunggu'
-                : pttMode === 'HOLD' ? 'Tahan PTT' : 'Ketuk Kunci'}
+                ? 'Jalur Sedang Digunakan'
+                : pttMode === 'HOLD'
+                ? 'Push-to-Talk (PTT)'
+                : 'Mode Kunci Transmisi'}
             </span>
           </button>
         </div>
       </div>
 
-      {/* 3. Commander Priority Override */}
-      {isCommander && isChannelLockedByOther && (
-        <button
-          onClick={handlePriorityOverride}
-          type="button"
-          className="mt-2 px-4 py-1.5 rounded-xl bg-red-700 text-white font-bold text-xs uppercase tracking-wider flex items-center gap-1.5 hover:bg-red-600 active:scale-95 transition-all font-mono-lcd shadow-md"
-        >
-          <Lightning size={14} weight="fill" className="text-yellow-300" />
-          <span>Interupsi Komandan</span>
-        </button>
-      )}
-
-      {/* 4. Mode Switcher (Hold vs Latch) */}
-      <div className="mt-2 flex items-center gap-1 bg-slate-900 border border-slate-800 p-1 rounded-xl text-xs font-mono-lcd">
+      {/* Mode Switcher Footer: Hold vs Latch */}
+      <div className="mt-3 flex items-center justify-center gap-2">
         <button
           type="button"
           onClick={() => {
+            if (isTransmitting) onStopTransmit();
             setPttMode('HOLD');
-            if (latched) {
-              setLatched(false);
-              onStopTransmit();
-            }
           }}
-          className={`px-3 py-1 rounded-lg transition-all flex items-center gap-1.5 ${
+          className={`px-3 py-1 rounded-lg text-[11px] font-mono-lcd font-bold transition-all border ${
             pttMode === 'HOLD'
-              ? 'bg-blue-600 text-white font-bold'
-              : 'text-slate-400 hover:text-slate-200'
+              ? 'bg-cyan-950 text-cyan-300 border-cyan-500/60 shadow-sm'
+              : 'bg-slate-900/80 text-slate-400 border-slate-800 hover:text-slate-200'
           }`}
         >
-          <LockKeyOpen size={13} weight="bold" />
-          <span>Hold</span>
+          TAHAN (HOLD)
         </button>
-
         <button
           type="button"
-          onClick={() => setPttMode('LATCH')}
-          className={`px-3 py-1 rounded-lg transition-all flex items-center gap-1.5 ${
+          onClick={() => {
+            if (isTransmitting) onStopTransmit();
+            setPttMode('LATCH');
+          }}
+          className={`px-3 py-1 rounded-lg text-[11px] font-mono-lcd font-bold transition-all border ${
             pttMode === 'LATCH'
-              ? 'bg-blue-600 text-white font-bold'
-              : 'text-slate-400 hover:text-slate-200'
+              ? 'bg-cyan-950 text-cyan-300 border-cyan-500/60 shadow-sm'
+              : 'bg-slate-900/80 text-slate-400 border-slate-800 hover:text-slate-200'
           }`}
         >
-          <LockKey size={13} weight="bold" />
-          <span>Latch</span>
+          KUNCI (LATCH)
         </button>
       </div>
     </div>

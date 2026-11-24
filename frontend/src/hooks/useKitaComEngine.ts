@@ -24,16 +24,17 @@ export interface FloorBroadcastState {
   timestamp: number;
 }
 
-interface ChannelInfo {
+export interface ChannelInfo {
   id: string;
   code: string;
   name: string;
+  memberCount?: number;
 }
 
 interface UseKitaComEngineProps {
   serverUrl?: string;
-  workspaceId: string;
-  channelId: string;
+  workspaceId?: string;
+  channelId: string; // Pairing Code Channel (e.g. KT-8492)
   channelName?: string;
   channelCode?: string;
   channels?: ChannelInfo[];
@@ -42,7 +43,7 @@ interface UseKitaComEngineProps {
   user: {
     userId: string;
     userName: string;
-    role: 'KOORDINATOR_KEAMANAN' | 'KETUA_PELAKSANA' | 'ANGGOTA_KEAMANAN' | 'PENGURUS_INTI' | 'PEMBINA';
+    role?: 'KOORDINATOR_KEAMANAN' | 'KETUA_PELAKSANA' | 'ANGGOTA_KEAMANAN' | 'PENGURUS_INTI' | 'PEMBINA';
     posJaga?: string;
   };
 }
@@ -67,7 +68,7 @@ const RTC_CONFIG: RTCConfiguration = {
 
 export function useKitaComEngine({
   serverUrl = import.meta.env.VITE_RELAY_SERVER_URL || '',
-  workspaceId,
+  workspaceId = 'default-network',
   channelId,
   channelName,
   channelCode,
@@ -76,12 +77,15 @@ export function useKitaComEngine({
   workspaceName,
   user
 }: UseKitaComEngineProps) {
+  // Normalize Channel ID / Pairing Code
+  const normalizedChannelId = (channelId || 'CH-01').toUpperCase().trim();
+
   // States
   const [isConnected, setIsConnected] = useState(false);
   const [isDutyActive, setIsDutyActive] = useState(false); // Mode Siaga KitaCom (Radio Power ON/OFF)
   const [floorState, setFloorState] = useState<FloorBroadcastState>({
     status: 'IDLE',
-    channelId,
+    channelId: normalizedChannelId,
     speakerId: null,
     speakerSocketId: null,
     speakerName: null,
@@ -110,8 +114,8 @@ export function useKitaComEngine({
   rosterRef.current = roster;
   const userRef = useRef(user);
   userRef.current = user;
-  const channelIdRef = useRef(channelId);
-  channelIdRef.current = channelId;
+  const channelIdRef = useRef(normalizedChannelId);
+  channelIdRef.current = normalizedChannelId;
   const channelNameRef = useRef(channelName);
   channelNameRef.current = channelName;
   const channelCodeRef = useRef(channelCode);
@@ -125,6 +129,7 @@ export function useKitaComEngine({
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const remoteAudioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  const makingOfferRef = useRef<Map<string, boolean>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
 
   // Monitor Battery API
@@ -154,7 +159,7 @@ export function useKitaComEngine({
     }
 
     if (audioCtxRef.current.state === 'suspended') {
-      audioCtxRef.current.resume();
+      audioCtxRef.current.resume().catch(() => {});
     }
 
     return audioCtxRef.current;
@@ -172,42 +177,32 @@ export function useKitaComEngine({
           noiseSuppression: true,
           autoGainControl: true,
           channelCount: 1,
-          sampleRate: 48000,
-          // Mobile & browser-level Acoustic Echo Cancellation hints
-          googEchoCancellation: true,
-          googAutoGainControl: true,
-          googNoiseSuppression: true,
-          googHighpassFilter: true
+          sampleRate: 48000
         } as MediaTrackConstraints
       });
-      // Default: muted (Half-Duplex PTT: silence until button is actively held)
+      
+      // Default: disabled (Half-Duplex PTT: silence until button is actively held)
       stream.getAudioTracks().forEach(track => {
-        track.enabled = false;
+        track.enabled = isTransmittingRef.current;
       });
       localStreamRef.current = stream;
 
-      // Attach or replace track on all existing WebRTC peer connections
+      // Pasang track ke semua RTCPeerConnection yang sudah ada via replaceTrack atau sender
       const audioTrack = stream.getAudioTracks()[0];
       if (audioTrack) {
-        peerConnectionsRef.current.forEach((pc, targetSocketId) => {
+        peerConnectionsRef.current.forEach((pc) => {
           const senders = pc.getSenders();
-          const audioSender = senders.find(s => s.track && s.track.kind === 'audio');
+          const audioSender = senders.find(s => s.track?.kind === 'audio' || !s.track);
           if (audioSender) {
             audioSender.replaceTrack(audioTrack).catch(err => {
               console.warn('[KitaCom WebRTC] replaceTrack error:', err);
             });
           } else {
-            pc.addTrack(audioTrack, stream);
-            // Renegotiate offer with target peer
-            pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false })
-              .then(offer => pc.setLocalDescription(offer))
-              .then(() => {
-                socketRef.current?.emit('webrtc:offer', {
-                  toSocketId: targetSocketId,
-                  offer: pc.localDescription
-                });
-              })
-              .catch(err => console.error('[KitaCom WebRTC] Error renegotiating after addTrack:', err));
+            try {
+              pc.addTrack(audioTrack, stream);
+            } catch (e) {
+              console.warn('[KitaCom WebRTC] addTrack fallback notice:', e);
+            }
           }
         });
       }
@@ -218,11 +213,8 @@ export function useKitaComEngine({
     }
   }, []);
 
-  // WebRTC Peer Connection Factory (Mesh P2P with Opus Codec)
+  // WebRTC Peer Connection Factory (Mesh P2P with Perfect Negotiation)
   const createPeerConnection = useCallback((targetSocketId: string, isInitiator: boolean, socket: Socket): RTCPeerConnection => {
-    if (!peerConnectionsRef.current || !(peerConnectionsRef.current instanceof Map)) {
-      peerConnectionsRef.current = new Map();
-    }
     const existing = peerConnectionsRef.current.get(targetSocketId);
     if (existing && existing.connectionState !== 'closed' && existing.connectionState !== 'failed') {
       return existing;
@@ -231,6 +223,15 @@ export function useKitaComEngine({
     console.log(`[KitaCom WebRTC] Inisialisasi peer connection ke ${targetSocketId} (initiator: ${isInitiator})`);
     const pc = new RTCPeerConnection(RTC_CONFIG);
     peerConnectionsRef.current.set(targetSocketId, pc);
+    makingOfferRef.current.set(targetSocketId, false);
+
+    // KUNCI EMAS WEBRTC BERGANTIAN: Selalu tambahkan transceiver audio sendrecv di awal!
+    // Ini memastikan jalur Opus dua arah terbentuk sempurna sebelum mic dipegang.
+    if (localStreamRef.current && localStreamRef.current.getAudioTracks()[0]) {
+      pc.addTrack(localStreamRef.current.getAudioTracks()[0], localStreamRef.current);
+    } else {
+      pc.addTransceiver('audio', { direction: 'sendrecv' });
+    }
 
     pc.onicecandidate = (event) => {
       if (event.candidate && socket && socket.connected) {
@@ -254,38 +255,32 @@ export function useKitaComEngine({
         document.body.appendChild(audioEl);
         remoteAudioElementsRef.current.set(targetSocketId, audioEl);
       }
-      // Strict Half-Duplex: jika radio mati ATAU sedang bicara (transmit), wajib bisu (mute)
+      
+      audioEl.srcObject = incomingStream;
       const shouldMute = !isDutyActiveRef.current || isTransmittingRef.current;
       audioEl.muted = shouldMute;
       audioEl.volume = shouldMute ? 0.0 : 1.0;
-      audioEl.srcObject = incomingStream;
       if (!shouldMute) {
         audioEl.play().catch(e => console.warn('[KitaCom WebRTC] audioEl play error:', e));
       }
     };
-
-    // Attach local track if mic already acquired
-    if (localStreamRef.current) {
-      localStreamRef.current.getAudioTracks().forEach(track => {
-        pc.addTrack(track, localStreamRef.current!);
-      });
-    }
 
     pc.onconnectionstatechange = () => {
       console.log(`[KitaCom WebRTC Peer ${targetSocketId}] State:`, pc.connectionState);
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         pc.close();
         peerConnectionsRef.current.delete(targetSocketId);
+        makingOfferRef.current.delete(targetSocketId);
       }
     };
 
+    // Inisiasi offer jika ditugaskan sebagai initiator (misal socket.id lebih kecil)
     if (isInitiator) {
       const initiateOffer = async () => {
         try {
-          const offer = await pc.createOffer({
-            offerToReceiveAudio: true,
-            offerToReceiveVideo: false
-          });
+          makingOfferRef.current.set(targetSocketId, true);
+          const offer = await pc.createOffer();
+          if (pc.signalingState !== 'stable') return;
           await pc.setLocalDescription(offer);
           socket.emit('webrtc:offer', {
             toSocketId: targetSocketId,
@@ -293,13 +288,15 @@ export function useKitaComEngine({
           });
         } catch (err) {
           console.error('[KitaCom WebRTC] Gagal membuat offer:', err);
+        } finally {
+          makingOfferRef.current.set(targetSocketId, false);
         }
       };
       initiateOffer();
     }
 
     return pc;
-  }, [initAudioEngine]);
+  }, []);
 
   // Screen Wake Lock
   const requestWakeLock = useCallback(async () => {
@@ -312,9 +309,8 @@ export function useKitaComEngine({
           setIsWakeLocked(false);
           wakeLockRef.current = null;
         });
-        console.log('[KitaCom] Screen WakeLock acquired');
       } catch (err) {
-        console.warn('[KitaCom] WakeLock request failed:', err);
+        console.warn('[KitaCom] WakeLock request notice:', err);
       }
     }
   }, []);
@@ -347,18 +343,14 @@ export function useKitaComEngine({
       document.body.appendChild(anchor);
     }
     silentAnchorRef.current = anchor;
-    anchor.volume = 0.5; // silence.wav hening total (0x00), volume 0.5 wajib agar Android MediaController aktif
+    anchor.volume = 0.5;
     if (anchor.paused) {
-      anchor.play().then(() => {
-        console.log('[KitaCall] Lockscreen audio anchor aktif');
-      }).catch((e) => {
-        console.warn('[KitaCall] Audio anchor play notice:', e);
-      });
+      anchor.play().catch(() => {});
     }
     return anchor;
   }, []);
 
-  // Toggle Mode Siaga KitaCom (Radio Power ON / OFF & Background Tembus Latar Belakang)
+  // Toggle Mode Siaga KitaCom (Radio Power ON / OFF)
   const toggleDutyMode = useCallback(async () => {
     const ctx = initAudioEngine();
     if (ctx.state === 'suspended') {
@@ -368,7 +360,6 @@ export function useKitaComEngine({
     isDutyActiveRef.current = newActive;
     setIsDutyActive(newActive);
 
-    // KUNCI LOCKSCREEN MOBILE: Mulai audio anchor /silence.wav seketika dalam gesture sentuhan user tanpa terhambat await!
     if (newActive) {
       ensureAnchorPlaying();
       requestWakeLock();
@@ -390,7 +381,7 @@ export function useKitaComEngine({
       if (navigator.vibrate) navigator.vibrate([40, 40]);
     }
 
-    // Gating Audio Level Hardware (langsung set nilai tanpa lag desync)
+    // Gating Audio Level Hardware
     if (dutyMasterGainRef.current) {
       dutyMasterGainRef.current.gain.cancelScheduledValues(ctx.currentTime);
       dutyMasterGainRef.current.gain.setValueAtTime(newActive ? 1.0 : 0.0, ctx.currentTime);
@@ -409,14 +400,14 @@ export function useKitaComEngine({
     if (socketRef.current && socketRef.current.connected) {
       socketRef.current.emit('kitacom:heartbeat', {
         userId: user.userId,
-        channelId,
+        channelId: channelIdRef.current,
         audioCtxState: ctx.state,
         wakeLock: newActive,
         dutyMode: newActive,
         batteryLvl: batteryLevel
       });
     }
-  }, [initAudioEngine, isDutyActive, ensureAnchorPlaying, requestWakeLock, releaseWakeLock, ensureLocalStream, channelId, user.userId, batteryLevel]);
+  }, [initAudioEngine, isDutyActive, ensureAnchorPlaying, requestWakeLock, releaseWakeLock, ensureLocalStream, user.userId, batteryLevel]);
 
   // Connect Socket.IO & WebRTC Listeners
   useEffect(() => {
@@ -424,7 +415,7 @@ export function useKitaComEngine({
     const targetUrl = isExplicitRemote ? `${serverUrl}/kitaradio` : '/kitaradio';
     const socket = io(targetUrl, {
       transports: ['websocket', 'polling'],
-      reconnectionAttempts: 20,
+      reconnectionAttempts: 25,
       reconnectionDelay: 1000
     });
     socketRef.current = socket;
@@ -436,15 +427,16 @@ export function useKitaComEngine({
       // Warm up audio context
       initAudioEngine();
 
-      // Join channel immediately
+      // Join pairing channel immediately
       socket.emit('kitacom:join_channel', {
         workspaceId,
-        channelId,
+        channelId: channelIdRef.current,
+        channelName: channelNameRef.current,
         userId: userRef.current.userId,
         userName: userRef.current.userName,
-        role: userRef.current.role,
+        role: userRef.current.role || 'ANGGOTA_KEAMANAN',
         dutyMode: isDutyActiveRef.current,
-        posJaga: userRef.current.posJaga
+        posJaga: userRef.current.posJaga || 'Patroli Lapangan'
       });
     });
 
@@ -458,10 +450,20 @@ export function useKitaComEngine({
       floorStateRef.current = state;
       setFloorState(state);
 
+      const isMeSpeaking = state.speakerSocketId 
+        ? state.speakerSocketId === socket.id 
+        : state.speakerId === userRef.current.userId;
+
       if (state.status === 'LOCKED') {
-        // Suara HANYA masuk dan direspons jika Mode Siaga AKTIF dan bukan diri sendiri
-        if (!isTransmittingRef.current && isDutyActiveRef.current) {
+        // Suara HANYA masuk dan direspons jika Mode Siaga AKTIF dan bukan diri kita sendiri yang sedang bicara
+        if (!isMeSpeaking && isDutyActiveRef.current) {
           setIsReceiving(true);
+          // Buka suara remote audio elements seketika
+          remoteAudioElementsRef.current.forEach((audioEl) => {
+            audioEl.muted = false;
+            audioEl.volume = 1.0;
+            audioEl.play().catch(() => {});
+          });
         }
       } else if (state.status === 'IDLE') {
         setIsReceiving(false);
@@ -508,18 +510,9 @@ export function useKitaComEngine({
       }
     });
 
-    // Access Denied: Personel tidak terdaftar di frekuensi ini
-    socket.on('kitacom:access_denied', async (data: { channelId: string; channelCode?: string; reason: string }) => {
-      console.warn('[KitaCom Security] Akses frekuensi ditolak:', data);
-      if (audioCtxRef.current) {
-        await TacticalAudioSynthesizer.playChannelBusyTone(audioCtxRef.current);
-      }
-      alert(data.reason || 'Akses ditolak: Anda belum ditugaskan oleh Koordinator di saluran ini.');
-    });
-
-    // Roster update: Hubungkan WebRTC Mesh dengan anggota lain
+    // Roster update: Hubungkan WebRTC Mesh dengan anggota lain di saluran pairing
     socket.on('kitacom:roster_update', async (data: { channelId: string; roster: ChannelMember[] }) => {
-      if (data.channelId === channelId) {
+      if (data.channelId === channelIdRef.current) {
         setRoster(data.roster);
         rosterRef.current = data.roster;
 
@@ -538,6 +531,7 @@ export function useKitaComEngine({
           if (!activeSocketIds.has(sid)) {
             pc.close();
             peerConnectionsRef.current.delete(sid);
+            makingOfferRef.current.delete(sid);
             const audioEl = remoteAudioElementsRef.current.get(sid);
             if (audioEl) {
               audioEl.pause();
@@ -550,11 +544,24 @@ export function useKitaComEngine({
       }
     });
 
-    // WebRTC Signaling: Offer
+    // WebRTC Signaling: Offer (dengan Perfect Negotiation)
     socket.on('webrtc:offer', async (data: { fromSocketId: string; offer: RTCSessionDescriptionInit }) => {
       try {
         console.log('[KitaCom WebRTC] Menerima offer dari:', data.fromSocketId);
         const pc = createPeerConnection(data.fromSocketId, false, socket);
+        
+        // Perfect Negotiation Collision check:
+        const isPolite = socket.id > data.fromSocketId;
+        const isMakingOffer = makingOfferRef.current.get(data.fromSocketId) || false;
+        const offerCollision = isMakingOffer || pc.signalingState !== 'stable';
+
+        if (offerCollision) {
+          if (!isPolite) {
+            console.log('[KitaCom WebRTC] Mengabaikan collision offer dari peer impolite');
+            return;
+          }
+        }
+
         await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
         
         // Flush any queued ICE candidates
@@ -580,7 +587,7 @@ export function useKitaComEngine({
       try {
         console.log('[KitaCom WebRTC] Menerima answer dari:', data.fromSocketId);
         const pc = peerConnectionsRef.current.get(data.fromSocketId);
-        if (pc) {
+        if (pc && pc.signalingState === 'have-local-offer') {
           await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
 
           // Flush any queued ICE candidates
@@ -603,7 +610,6 @@ export function useKitaComEngine({
           if (pc.remoteDescription && pc.remoteDescription.type) {
             await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
           } else {
-            // Antrekan candidate jika remoteDescription belum siap
             const list = pendingCandidatesRef.current.get(data.fromSocketId) || [];
             list.push(data.candidate);
             pendingCandidatesRef.current.set(data.fromSocketId, list);
@@ -614,7 +620,7 @@ export function useKitaComEngine({
       }
     });
 
-    // Emergency Siren (Alarm Darurat Komando tetap tembus silent jika disiagakan)
+    // Emergency Siren
     socket.on('ptt:emergency_alert', async (data: { commanderName: string; emergencyNote: string }) => {
       setEmergencyAlert({ commanderName: data.commanderName, note: data.emergencyNote });
       if (audioCtxRef.current) {
@@ -625,14 +631,13 @@ export function useKitaComEngine({
       }
     });
 
-    // Cleanup: Menutup semua koneksi WebRTC, membuang audio element & disconnect socket
+    // Cleanup saat unmount atau saat channel berganti
     return () => {
-      console.log('[KitaRadio Socket] Membersihkan koneksi socket & WebRTC:', socket.id);
-      
       peerConnectionsRef.current.forEach((pc) => {
         try { pc.close(); } catch (e) {}
       });
       peerConnectionsRef.current.clear();
+      makingOfferRef.current.clear();
 
       remoteAudioElementsRef.current.forEach((audioEl) => {
         try {
@@ -645,8 +650,6 @@ export function useKitaComEngine({
 
       pendingCandidatesRef.current.clear();
 
-      // kitacall-lockscreen-anchor dijaga tetap hidup agar kendali MediaSession lockscreen tidak terputus saat berganti saluran
-
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(t => t.stop());
         localStreamRef.current = null;
@@ -656,15 +659,15 @@ export function useKitaComEngine({
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [serverUrl, workspaceId, channelId, user.userId, createPeerConnection, initAudioEngine]);
+  }, [serverUrl, normalizedChannelId, user.userId, createPeerConnection, initAudioEngine]);
 
-  // Periodic Heartbeat (Tiap 15 Detik sesuai PRD)
+  // Periodic Heartbeat
   useEffect(() => {
     const timer = setInterval(() => {
       if (socketRef.current && socketRef.current.connected) {
         socketRef.current.emit('kitacom:heartbeat', {
           userId: user.userId,
-          channelId,
+          channelId: channelIdRef.current,
           audioCtxState: audioCtxRef.current?.state || 'suspended',
           wakeLock: isWakeLocked,
           dutyMode: isDutyActiveRef.current,
@@ -673,7 +676,7 @@ export function useKitaComEngine({
       }
     }, 15000);
     return () => clearInterval(timer);
-  }, [channelId, user.userId, isWakeLocked, batteryLevel]);
+  }, [normalizedChannelId, user.userId, isWakeLocked, batteryLevel]);
 
   // 2. Start Transmitting (PTT Ditekan)
   const startTransmitting = useCallback(async () => {
@@ -685,7 +688,7 @@ export function useKitaComEngine({
 
     const ctx = initAudioEngine();
     if (ctx.state === 'suspended') {
-      await ctx.resume();
+      await ctx.resume().catch(() => {});
     }
 
     isTransmittingRef.current = true;
@@ -702,10 +705,10 @@ export function useKitaComEngine({
 
     if (socketRef.current && socketRef.current.connected) {
       socketRef.current.emit('ptt:request_floor', {
-        channelId,
+        channelId: channelIdRef.current,
         userId: currentUser.userId,
         userName: currentUser.userName,
-        role: currentUser.role,
+        role: currentUser.role || 'ANGGOTA_KEAMANAN',
         isPriority
       });
     }
@@ -728,7 +731,7 @@ export function useKitaComEngine({
       isTransmittingRef.current = false;
       setIsTransmitting(false);
     }
-  }, [initAudioEngine, ensureLocalStream, channelId]);
+  }, [initAudioEngine, ensureLocalStream]);
 
   // 3. Stop Transmitting (PTT Dilepas)
   const stopTransmitting = useCallback(() => {
@@ -754,37 +757,32 @@ export function useKitaComEngine({
 
     if (socketRef.current && socketRef.current.connected) {
       socketRef.current.emit('ptt:release_floor', {
-        channelId,
+        channelId: channelIdRef.current,
         userId: userRef.current.userId
       });
     }
 
-    // Umpan balik haptik lepas: [30, 50, 30]
     if (navigator.vibrate) navigator.vibrate([30, 50, 30]);
-  }, [channelId]);
+  }, []);
 
-  // Lapis 3: Media Session API (Kendali Layar Terkunci / Lockscreen HP & Headset TWS ala Spotify)
+  // Lapis 3: Media Session API (Kendali Layar Terkunci / Lockscreen HP & Headset TWS)
   useEffect(() => {
     if (!('mediaSession' in navigator)) return;
 
-    const displayCode = channelCode || (channels?.find(c => c.id === channelId)?.code) || channelId;
-    const displayName = channelName || (channels?.find(c => c.id === channelId)?.name) || 'Saluran Taktis';
-    const channelIdx = channels ? channels.findIndex(c => c.id === channelId || c.code === channelId) : -1;
-    const channelCounter = channelIdx >= 0 && channels && channels.length > 0 
-      ? `(${channelIdx + 1}/${channels.length})` 
-      : '';
+    const displayCode = channelCode || channelIdRef.current || 'CH-01';
+    const displayName = channelName || 'Saluran Taktis';
 
     let title = `📻 ${displayCode}: ${displayName}`;
-    let artist = `▶️ Buka Mic | ⏭️ Ganti Saluran ${channelCounter}`;
+    let artist = `▶️ Buka Mic | ⏭️ Ganti Saluran`;
     let album = `KitaCall • ${workspaceName || 'Transceiver Taktis'}`;
 
     if (isTransmitting) {
       title = `🔴 [TRANSMIT] ${displayCode}: ${displayName}`;
-      artist = '🎙️ Anda Sedang Bicara • Tekan ⏸️ utk Selesai';
+      artist = '🎙️ Anda Sedang Bicara • Lepas PTT utk Selesai';
       album = 'KitaCall Transceiver (Transmisi Aktif)';
-    } else if (floorState.speakerId && floorState.speakerId !== user.userId) {
+    } else if (floorState.speakerId && floorState.speakerSocketId !== socketRef.current?.id) {
       title = `🔊 ${floorState.speakerName || 'Personel'} Bicara...`;
-      artist = `Saluran ${displayCode} • ${displayName} ${channelCounter}`;
+      artist = `Saluran ${displayCode} • ${displayName}`;
       album = 'KitaCall Monitor Frekuensi';
     } else if (!isDutyActive) {
       title = `🔴 Radio Nonaktif — ${displayCode}`;
@@ -804,44 +802,13 @@ export function useKitaComEngine({
         ]
       });
 
-      // Menjaga status media session aktif agar widget lockscreen selalu tampil
-      if (isTransmitting) {
-        navigator.mediaSession.playbackState = 'playing';
-      } else if (isDutyActive) {
+      if (isTransmitting || isDutyActive) {
         navigator.mediaSession.playbackState = 'playing';
       } else {
         navigator.mediaSession.playbackState = 'none';
       }
     } catch (e) {}
 
-    // Sync ke Service Worker Sticky Lockscreen Notification (Garis pertahanan ganda untuk lockscreen HP)
-    if ('serviceWorker' in navigator && 'Notification' in window && Notification.permission === 'granted') {
-      navigator.serviceWorker.ready.then((reg) => {
-        if (isDutyActive) {
-          const micActionTitle = isTransmitting ? '⏹️ Tutup Mic' : '🎙️ Buka Mic';
-          reg.showNotification(title, {
-            body: artist,
-            icon: '/logo.png',
-            badge: '/logo.png',
-            tag: 'kitacall-radio-live',
-            renotify: false,
-            silent: true,
-            requireInteraction: true,
-            data: { url: '/?source=lockscreen' },
-            actions: [
-              { action: 'toggle_mic', title: micActionTitle },
-              { action: 'next_channel', title: '⏭️ Saluran Lain' }
-            ]
-          }).catch(() => {});
-        } else {
-          reg.getNotifications({ tag: 'kitacall-radio-live' }).then((notifications) => {
-            notifications.forEach((n) => n.close());
-          }).catch(() => {});
-        }
-      }).catch(() => {});
-    }
-
-    // Handler Aksi Lockscreen & Headset TWS (Play/Pause keduanya berfungsi sebagai toggle PTT mic):
     const handleToggleMic = () => {
       if (!isDutyActiveRef.current) {
         toggleDutyMode();
@@ -860,156 +827,49 @@ export function useKitaComEngine({
         stopTransmitting();
       }
     });
-
-    // 4. Next Track (⏭️) / Seek Forward (⏩) -> Ganti Channel Berikutnya (Spotify style)
-    const handleNextChannel = () => {
-      const list = channelsRef.current;
-      if (list && list.length > 1 && onSelectChannelRef.current) {
-        const curId = channelIdRef.current;
-        const currentIdx = list.findIndex(c => c.id === curId || c.code === curId);
-        const nextIdx = (currentIdx + 1) % list.length;
-        const targetChan = list[nextIdx];
-        if (targetChan) {
-          onSelectChannelRef.current(targetChan.id);
-          if (audioCtxRef.current) {
-            TacticalAudioSynthesizer.playPreflightGuard(audioCtxRef.current);
-          }
-          if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
-        }
-      }
-    };
-
-    // 5. Previous Track (⏮️) / Seek Backward (⏪) -> Ganti Channel Sebelumnya (Spotify style)
-    const handlePrevChannel = () => {
-      const list = channelsRef.current;
-      if (list && list.length > 1 && onSelectChannelRef.current) {
-        const curId = channelIdRef.current;
-        const currentIdx = list.findIndex(c => c.id === curId || c.code === curId);
-        const prevIdx = (currentIdx - 1 + list.length) % list.length;
-        const targetChan = list[prevIdx];
-        if (targetChan) {
-          onSelectChannelRef.current(targetChan.id);
-          if (audioCtxRef.current) {
-            TacticalAudioSynthesizer.playPreflightGuard(audioCtxRef.current);
-          }
-          if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
-        }
-      }
-    };
-
-    try {
-      navigator.mediaSession.setActionHandler('nexttrack', handleNextChannel);
-      navigator.mediaSession.setActionHandler('previoustrack', handlePrevChannel);
-      navigator.mediaSession.setActionHandler('seekforward', handleNextChannel);
-      navigator.mediaSession.setActionHandler('seekbackward', handlePrevChannel);
-    } catch (e) {}
   }, [
     isDutyActive,
-    channelId,
+    normalizedChannelId,
     channelCode,
     channelName,
-    channels,
     workspaceName,
     isTransmitting,
     floorState.speakerId,
+    floorState.speakerSocketId,
     floorState.speakerName,
     startTransmitting,
     stopTransmitting,
     toggleDutyMode
   ]);
 
-  // Listener Pesan Interaktif dari Notifikasi Layar Kunci Service Worker
-  useEffect(() => {
-    if (!('serviceWorker' in navigator)) return;
-
-    const handleSwMessage = (e: MessageEvent) => {
-      if (e.data?.type === 'LOCKSCREEN_TOGGLE_MIC') {
-        if (!isDutyActiveRef.current) {
-          toggleDutyMode();
-        }
-        if (!isTransmittingRef.current) {
-          startTransmitting();
-        } else {
-          stopTransmitting();
-        }
-      } else if (e.data?.type === 'LOCKSCREEN_NEXT_CHANNEL') {
-        const list = channelsRef.current;
-        if (list && list.length > 1 && onSelectChannelRef.current) {
-          const curId = channelIdRef.current;
-          const currentIdx = list.findIndex(c => c.id === curId || c.code === curId);
-          const nextIdx = (currentIdx + 1) % list.length;
-          const targetChan = list[nextIdx];
-          if (targetChan) {
-            onSelectChannelRef.current(targetChan.id);
-            if (audioCtxRef.current) {
-              TacticalAudioSynthesizer.playPreflightGuard(audioCtxRef.current);
-            }
-            if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
-          }
-        }
-      }
-    };
-
-    navigator.serviceWorker.addEventListener('message', handleSwMessage);
-    return () => {
-      navigator.serviceWorker.removeEventListener('message', handleSwMessage);
-    };
-  }, [toggleDutyMode, startTransmitting, stopTransmitting]);
-
   // Trigger Emergency Broadcast
   const triggerEmergencyAlert = useCallback((note: string) => {
     if (socketRef.current && socketRef.current.connected) {
       socketRef.current.emit('ptt:emergency_alert', {
         workspaceId,
-        channelId,
+        channelId: channelIdRef.current,
         commanderName: user.userName,
         emergencyNote: note || 'Panggilan Siaga Merah Lapangan'
       });
     }
-  }, [workspaceId, channelId, user.userName]);
+  }, [workspaceId, user.userName]);
 
   // Aktivasi eksplisit kendali lockscreen & perizinan
   const activateLockscreen = useCallback(async () => {
-    // 1. Minta izin Notifikasi jika belum (wajib untuk Android 13+)
     if ('Notification' in window && Notification.permission !== 'granted') {
       try {
         await Notification.requestPermission();
       } catch (e) {}
     }
 
-    // 2. Minta izin Mikrofon
     try {
       await ensureLocalStream();
     } catch (e) {}
 
-    // 3. Pastikan audio anchor & mode siaga aktif
     ensureAnchorPlaying();
 
     if (!isDutyActiveRef.current) {
       await toggleDutyMode();
-    }
-
-    // 4. Kirim notifikasi sistem konfirmasi via Service Worker (bebas crash di Android!)
-    if ('serviceWorker' in navigator && 'Notification' in window && Notification.permission === 'granted') {
-      try {
-        const reg = await navigator.serviceWorker.ready;
-        const displayCode = channelCodeRef.current || channelIdRef.current || 'CH-01';
-        await reg.showNotification(`📻 Saluran ${displayCode}: Kendali Lockscreen Aktif`, {
-          body: '▶️ Buka Mic | ⏭️ Ganti Saluran • Kendali Saku & Headset Siap!',
-          icon: '/logo.png',
-          badge: '/logo.png',
-          tag: 'kitacall-radio-live',
-          renotify: false,
-          silent: true,
-          requireInteraction: true,
-          actions: [
-            { action: 'toggle_mic', title: '🎙️ Buka/Tutup Mic' },
-            { action: 'next_channel', title: '⏭️ Ganti Saluran' }
-          ]
-        });
-      } catch (e) {
-        console.warn('[KitaCall SW Notification Error]:', e);
-      }
     }
   }, [ensureLocalStream, ensureAnchorPlaying, toggleDutyMode]);
 
@@ -1020,6 +880,7 @@ export function useKitaComEngine({
     activateLockscreen,
     floorState,
     roster,
+    currentSocketId: socketRef.current?.id,
     isTransmitting,
     isReceiving,
     startTransmitting,
